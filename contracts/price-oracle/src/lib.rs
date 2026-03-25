@@ -1,35 +1,39 @@
 #![no_std]
+
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address, Env,
     Symbol,
 };
 
-/// Error types for the price oracle contract
+/// Storage key for the price data map.
+const PRICE_DATA_KEY: Symbol = symbol_short!("PRICES");
+
+/// Error types for the price oracle contract.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
-    /// Asset does not exist in the price oracle
+    /// Asset does not exist in the price oracle.
     AssetNotFound = 1,
-    /// Unauthorized caller - not a whitelisted provider
+    /// Unauthorized caller - not a whitelisted provider.
     Unauthorized = 2,
     /// Asset symbol is not in the approved list (NGN, KES, GHS)
     InvalidAssetSymbol = 3,
 }
 
-/// Price data structure containing price information for an asset
+/// Price data structure containing price information for an asset.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PriceData {
-    /// The asset symbol (approved: NGN, KES, GHS)
+    /// The asset symbol (e.g., "XLM", "BTC").
     pub asset: Symbol,
-    /// The price value (stored as scaled integer, e.g., 1000000 = 1.00 USD)
+    /// The price value (stored as a scaled integer, e.g. 1_000_000 = 1.00 USD).
     pub price: i128,
-    /// Timestamp when the price was last updated
+    /// Timestamp when the price was last updated.
     pub timestamp: u64,
 }
 
-/// Event emitted when a price is updated
+/// Event emitted when a price is updated.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PriceUpdated {
@@ -39,46 +43,48 @@ pub struct PriceUpdated {
     pub timestamp: u64,
 }
 
-/// Storage key for the price data map
-const PRICE_DATA_KEY: Symbol = symbol_short!("PRICES");
-const STALE_THRESHOLD_SECS: u64 = 86_400;
-
 #[contract]
 pub struct PriceOracle;
 
-#[contractimpl]
-impl PriceOracle {
-    /// Returns true if the symbol is approved for oracle prices (NGN, KES, GHS).
-    pub fn is_approved_asset(_env: Env, asset: Symbol) -> bool {
-        asset_symbol::is_approved_asset_symbol(asset)
+/// Returns the signed percentage change in basis points.
+///
+/// Example: 1_000_000 -> 1_200_000 returns 2_000 (20.00%).
+/// Example: 1_000_000 -> 800_000 returns -2_000 (-20.00%).
+/// Returns `None` when `old_price` is zero because the percentage change is undefined.
+pub fn calculate_percentage_change_bps(old_price: i128, new_price: i128) -> Option<i128> {
+    if old_price == 0 {
+        return None;
     }
 
-    /// Get the price data for a specific asset
-    ///
-    /// # Arguments
-    /// * `env` - The contract environment
-    /// * `asset` - The asset symbol to look up
-    ///
-    /// # Returns
-    /// * `Ok(PriceData)` - The price data for the asset
-    /// * `Err(Error::AssetNotFound)` - If the asset doesn't exist
-    pub fn get_price(env: Env, asset: Symbol) -> Result<PriceData, Error> {
-        // Get the persistent storage instance
-        let storage = env.storage().persistent();
+    let delta = new_price.checked_sub(old_price)?;
+    let scaled = delta.checked_mul(10_000)?;
+    scaled.checked_div(old_price)
+}
 
-        // Try to retrieve the price data map
+/// Returns the absolute percentage difference in basis points.
+///
+/// This is convenient for flash-crash or spike detection because the caller can
+/// compare the result directly against a threshold without worrying about direction.
+pub fn calculate_percentage_difference_bps(old_price: i128, new_price: i128) -> Option<i128> {
+    calculate_percentage_change_bps(old_price, new_price).map(i128::abs)
+}
+
+#[contractimpl]
+impl PriceOracle {
+    /// Get the price data for a specific asset.
+    pub fn get_price(env: Env, asset: Symbol) -> Result<PriceData, Error> {
+        let storage = env.storage().persistent();
         let prices: soroban_sdk::Map<Symbol, PriceData> = storage
             .get(&PRICE_DATA_KEY)
             .unwrap_or_else(|| soroban_sdk::Map::new(&env));
 
-        // Try to get the price for the specified asset
         match prices.get(asset) {
             Some(price_data) => Ok(price_data),
             None => Err(Error::AssetNotFound),
         }
     }
 
-    /// Returns None instead of an error when asset is not found — safe for frontend callers.
+    /// Returns `None` instead of an error when the asset is not found.
     pub fn get_price_safe(env: Env, asset: Symbol) -> Option<PriceData> {
         let prices: soroban_sdk::Map<Symbol, PriceData> = env
             .storage()
@@ -88,7 +94,7 @@ impl PriceOracle {
         prices.get(asset)
     }
 
-    /// Returns a Vec of all currently tracked asset symbols.
+    /// Returns a vector of all currently tracked asset symbols.
     pub fn get_all_assets(env: Env) -> soroban_sdk::Vec<Symbol> {
         let prices: soroban_sdk::Map<Symbol, PriceData> = env
             .storage()
@@ -98,28 +104,9 @@ impl PriceOracle {
         prices.keys()
     }
 
-    /// Check whether a stored timestamp is older than 24 hours relative to the
-    /// current ledger timestamp.
-    pub fn is_timestamp_stale(env: Env, stored_timestamp: u64) -> bool {
-        env.ledger().timestamp().saturating_sub(stored_timestamp) > STALE_THRESHOLD_SECS
-    }
-
-    /// Set the price data for a specific asset (admin function)
-    ///
-    /// # Arguments
-    /// * `env` - The contract environment
-    /// * `asset` - The asset symbol
-    /// * `val` - The price value to store
-    ///
-    /// # Errors
-    /// * `Error::InvalidAssetSymbol` - If `asset` is not NGN, KES, or GHS
-    pub fn set_price(env: Env, asset: Symbol, val: i128) -> Result<(), Error> {
-        if !asset_symbol::is_approved_asset_symbol(asset.clone()) {
-            return Err(Error::InvalidAssetSymbol);
-        }
-
+    /// Set the price data for a specific asset.
+    pub fn set_price(env: Env, asset: Symbol, val: i128) {
         let storage = env.storage().persistent();
-
         let mut prices: soroban_sdk::Map<Symbol, PriceData> = storage
             .get(&PRICE_DATA_KEY)
             .unwrap_or_else(|| soroban_sdk::Map::new(&env));
@@ -135,38 +122,17 @@ impl PriceOracle {
         Ok(())
     }
 
-    /// Update the price for a specific asset (authorized backend relayer function)
-    ///
-    /// # Arguments
-    /// * `env` - The contract environment
-    /// * `source` - The address of the authorized backend relayer
-    /// * `asset` - The asset symbol to update
-    /// * `price` - The new price (as i128)
-    ///
-    /// # Errors
-    /// * `Error::InvalidAssetSymbol` - If `asset` is not NGN, KES, or GHS
-    ///
-    /// # Panics
-    /// If `source` is not a whitelisted provider.
-    pub fn update_price(env: Env, source: Address, asset: Symbol, price: i128) -> Result<(), Error> {
-        if !asset_symbol::is_approved_asset_symbol(asset.clone()) {
-            return Err(Error::InvalidAssetSymbol);
-        }
-
-        if !crate::auth::_is_provider(&env, &source) {
-            panic!("Unauthorised: caller is not a whitelisted provider");
-        }
-
+    /// Update the price for a specific asset after provider auth.
+    pub fn update_price(env: Env, source: Address, asset: Symbol, price: i128) {
+        crate::auth::_require_provider(&env, &source);
         source.require_auth();
 
-        let storage = env.storage().instance();
-
+        let storage = env.storage().persistent();
         let mut prices: soroban_sdk::Map<Symbol, PriceData> = storage
             .get(&PRICE_DATA_KEY)
             .unwrap_or_else(|| soroban_sdk::Map::new(&env));
 
         let timestamp = env.ledger().timestamp();
-
         let price_data = PriceData {
             asset: asset.clone(),
             price,
@@ -177,14 +143,12 @@ impl PriceOracle {
         storage.set(&PRICE_DATA_KEY, &prices);
 
         PriceUpdated {
-            source: source.clone(),
-            asset: asset.clone(),
+            source,
+            asset,
             price,
             timestamp,
         }
         .publish(&env);
-
-        Ok(())
     }
 }
 
