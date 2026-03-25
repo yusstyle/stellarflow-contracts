@@ -39,6 +39,7 @@ pub struct PriceUpdated {
 
 /// Storage key for the price data map
 const PRICE_DATA_KEY: Symbol = symbol_short!("PRICES");
+const STALE_THRESHOLD_SECS: u64 = 86_400;
 
 #[contract]
 pub struct PriceOracle;
@@ -88,6 +89,12 @@ impl PriceOracle {
             .get(&PRICE_DATA_KEY)
             .unwrap_or_else(|| soroban_sdk::Map::new(&env));
         prices.keys()
+    }
+
+    /// Check whether a stored timestamp is older than 24 hours relative to the
+    /// current ledger timestamp.
+    pub fn is_timestamp_stale(env: Env, stored_timestamp: u64) -> bool {
+        env.ledger().timestamp().saturating_sub(stored_timestamp) > STALE_THRESHOLD_SECS
     }
 
     /// Set the price data for a specific asset (admin function)
