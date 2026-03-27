@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Env};
+use soroban_sdk::{contracttype, Address, Env, Symbol};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Storage Key
